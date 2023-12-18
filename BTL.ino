@@ -1,8 +1,8 @@
-#include <Adafruit_Sensor.h>
-#include <DHT.h>
-#include <WiFi.h>
 #include <Wire.h>
 #include "MAX30100_PulseOximeter.h"
+#include <WiFi.h>
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <PubSubClient.h>
@@ -13,16 +13,13 @@
 #define DS18B20 5
 #define REPORTING_PERIOD_MS 1000
 
-float temperature, humidity, bpm, sp, body;
-
-int cb = A0;
-int doc_cb, TBcb;
-
+float bpm, sp, body, temperature, humidity;
 const char* ssid = "Quan";
 const char* password = "12345678";
 
 DHT dht(DHTPIN, DHTTYPE);
 PulseOximeter pox;
+uint32_t tsLastReport = 0;
 OneWire oneWire(DS18B20);
 DallasTemperature sensors(&oneWire);
 
@@ -33,7 +30,7 @@ WiFiClient espClient;
 PubSubClient client(espClient);
 
 void onBeatDetected() {
-  Serial.println("Beat!");
+  Serial.println("Beat Detected!");
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
@@ -46,20 +43,19 @@ void callback(char* topic, byte* payload, unsigned int length) {
     deserializeJson(doc, payload, length);
     String jsonString;
     serializeJson(doc, jsonString);
-
     Serial.println(jsonString);
-
-    temperature = doc["nhietdo"];
-    humidity = doc["doam"];
     bpm = doc["nhiptim"];
     sp = doc["oxy"];
     body = doc["cothe"];
+    temperature = doc["nhietdo"];
+    humidity = doc["doam"];
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(10);
+  pinMode(19, OUTPUT);
+  delay(100);
 
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
@@ -70,90 +66,73 @@ void setup() {
 
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
-  Wire.begin();
-  pox.begin();
+  Serial.print("Initializing pulse oximeter..");
+
+  if (!pox.begin()) {
+    Serial.println("FAILED");
+    for (;;);
+  } else {
+    Serial.println("SUCCESS");
+    pox.setOnBeatDetectedCallback(onBeatDetected);
+  }
+
+  pox.setIRLedCurrent(MAX30100_LED_CURR_7_6MA);
   dht.begin();
-  sensors.begin(); // Initialize DS18B20 sensor
+  sensors.begin();
   reconnect();
 }
 
-unsigned long DHTdelay = 3000;
 unsigned long timer = 0;
 
 void loop() {
   client.loop();
+  pox.update();
+  bpm = pox.getHeartRate();
+  sp = pox.getSpO2();
+  sensors.requestTemperatures();
+  body = sensors.getTempCByIndex(0);
+  temperature = dht.readTemperature();
+  humidity = dht.readHumidity();
 
-  unsigned long currentTime = millis();
-  if (currentTime - timer >= DHTdelay) {
-    timer = currentTime;
-
-    TBcb = analogRead(cb);
-    sensors_event_t event;
-
-    event.temperature = dht.readTemperature();
-    temperature = event.temperature;
-
-    event.relative_humidity = dht.readHumidity();
-    humidity = event.relative_humidity;
-
-    bpm = pox.getHeartRate();
-    sp = pox.getSpO2();
-
-    // Retrieve body temperature from the Dallas Temperature library
-    body = sensors.getTempCByIndex(0);
-
-    // ... (rest of your code)
-    float phantramao = map(TBcb, 0, 1023, 0, 100);    //Chuyển giá trị Analog thành giá trị %
-    float phantramthuc = 100 - phantramao; 
-
-    if (isnan(temperature) || isnan(humidity)) {
-        Serial.println("Failed to read from DHT sensor!");
-        // return;
-    }
+  if (millis() - tsLastReport > REPORTING_PERIOD_MS) {
     if (isnan(bpm) || isnan(sp)) {
-        Serial.println("Failed to read from DS sensor!");
-        // return;
+      Serial.println("Failed to read from Pulse Oximeter!");
+    } else {
+      float nhietdo = round(temperature * 10) / 10.0;
+      float doam = round(humidity * 10) / 10.0;
+      float cothe = round(body * 10) / 10.0;
+      float nhiptim = round(bpm * 10) / 10;
+      float oxy = round(sp * 10) / 10;
+
+      Serial.print("Nhịp tim: ");
+      Serial.println(bpm);
+      Serial.print("Nồng độ Oxy trong máu: ");
+      Serial.println(sp);
+      Serial.print("Nhiệt độ cơ thể: ");
+      Serial.println(body);
+      Serial.print("Nhiệt độ: ");
+      Serial.println(temperature);
+      Serial.print("Độ ẩm: ");
+      Serial.println(humidity);
+      Serial.println("\n");
+
+      StaticJsonDocument<200> jsonDoc;
+      jsonDoc["bpm"] = nhiptim;
+      jsonDoc["sp"] = oxy;
+      jsonDoc["body"] = cothe;
+      jsonDoc["temp"] = nhietdo;
+      jsonDoc["humi"] = doam;
+
+      char jsonBuffer[200];
+      serializeJson(jsonDoc, jsonBuffer);
+
+      client.publish("topic", jsonBuffer);
+
+      if (!client.connected()) {
+        reconnect();
+      }
+      tsLastReport = millis();
     }
-    if (isnan(body)) {
-        Serial.println("Failed to read from onewire sensor!");
-        // return;
-    }
-    float nhietdo = round(temperature * 10) / 10.0; // Làm tròn temperature với 1 chữ số thập phân
-    float doam = round(humidity * 10) / 10.0; // Làm tròn humidity với 1 chữ số thập phân
-    float nhiptim = round(bpm * 10) / 10.0;
-    float oxy = round(sp * 10) / 10.0;
-    float cothe = round(body * 10) / 10.0;
-    // float doamdat = round(phantramthuc * 10) / 10.0; // Làm tròn soil với 1 chữ số thập phân
-    delay (1000);
-    Serial.print("Nhiệt độ: ");
-    Serial.println(temperature);
-    Serial.print("Độ ẩm: ");
-    Serial.println(humidity);
-    Serial.print("Nhịp tim: ");
-    Serial.println(bpm);
-    Serial.print("Oxy: ");
-    Serial.println(sp);
-    Serial.print("cothe: ");
-    Serial.println(body);
-    Serial.println("\n");
-
-    StaticJsonDocument<200> jsonDoc;
-    jsonDoc["temp"] = nhietdo;
-    jsonDoc["humi"] = doam;
-    jsonDoc["bpm"] = nhiptim;
-    jsonDoc["sp"] = oxy;
-    jsonDoc["body"] = cothe;
-
-    char jsonBuffer[200];
-    serializeJson(jsonDoc, jsonBuffer);
-
-    client.publish("topic", jsonBuffer);
-
-    if (!client.connected()) {
-      reconnect();
-    }
-
-    doc_cb = 0;
   }
 }
 
